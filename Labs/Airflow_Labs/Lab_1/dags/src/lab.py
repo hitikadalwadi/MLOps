@@ -1,88 +1,148 @@
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.cluster import KMeans
-from kneed import KneeLocator
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, f1_score
 import pickle
 import os
+import json
 import base64
+
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+MODEL_DIR = os.path.join(BASE_DIR, "model")
+HISTORY_PATH = os.path.join(MODEL_DIR, "metrics_history.json")
+
+TARGET = "target"
+PRIMARY_METRIC = "accuracy"
+# A drop in the primary metric larger than this is reported as a regression.
+REGRESSION_TOLERANCE = 0.01
+
+
+def _encode(obj) -> str:
+    """Pickle an object and return it as a base64 string (JSON-safe for XCom)."""
+    return base64.b64encode(pickle.dumps(obj)).decode("ascii")
+
+
+def _decode(data_b64: str):
+    return pickle.loads(base64.b64decode(data_b64))
+
 
 def load_data():
     """
-    Loads data from a CSV file, serializes it, and returns the serialized data.
+    Loads the wine training set from CSV, serializes it, and returns the serialized data.
     Returns:
-        str: Base64-encoded serialized data (JSON-safe).
+        str: Base64-encoded serialized DataFrame (JSON-safe).
     """
-    print("We are here")
-    df = pd.read_csv(os.path.join(os.path.dirname(__file__), "../data/file.csv"))
-    serialized_data = pickle.dumps(df)                    # bytes
-    return base64.b64encode(serialized_data).decode("ascii")  # JSON-safe string
+    df = pd.read_csv(os.path.join(DATA_DIR, "wine_train.csv"))
+    print(f"Loaded training data: {df.shape[0]} rows, {df.shape[1]} columns")
+    return _encode(df)
+
 
 def data_preprocessing(data_b64: str):
     """
-    Deserializes base64-encoded pickled data, performs preprocessing,
-    and returns base64-encoded pickled clustered data.
+    Deserializes the training data, drops incomplete rows, and splits it into
+    features and labels.
+    Returns:
+        str: Base64-encoded pickled dict with keys "X" and "y".
     """
-    # decode -> bytes -> DataFrame
-    data_bytes = base64.b64decode(data_b64)
-    df = pickle.loads(data_bytes)
-
-    df = df.dropna()
-    clustering_data = df[["BALANCE", "PURCHASES", "CREDIT_LIMIT"]]
-
-    min_max_scaler = MinMaxScaler()
-    clustering_data_minmax = min_max_scaler.fit_transform(clustering_data)
-
-    # bytes -> base64 string for XCom
-    clustering_serialized_data = pickle.dumps(clustering_data_minmax)
-    return base64.b64encode(clustering_serialized_data).decode("ascii")
+    df = _decode(data_b64).dropna()
+    X = df.drop(columns=[TARGET])
+    y = df[TARGET]
+    print(f"Preprocessed data: {X.shape[0]} rows, {X.shape[1]} features")
+    return _encode({"X": X, "y": y})
 
 
 def build_save_model(data_b64: str, filename: str):
     """
-    Builds a KMeans model on the preprocessed data and saves it.
-    Returns the SSE list (JSON-serializable).
+    Trains a random forest classifier on the preprocessed data and saves it.
+    Returns the model hyperparameters (JSON-serializable) so later tasks can log them.
     """
-    # decode -> bytes -> numpy array
-    data_bytes = base64.b64decode(data_b64)
-    df = pickle.loads(data_bytes)
+    data = _decode(data_b64)
 
-    kmeans_kwargs = {"init": "random", "n_init": 10, "max_iter": 300, "random_state": 42}
-    sse = []
-    for k in range(1, 50):
-        kmeans = KMeans(n_clusters=k, **kmeans_kwargs)
-        kmeans.fit(df)
-        sse.append(kmeans.inertia_)
+    params = {"n_estimators": 150, "max_depth": 3, "random_state": 42}
+    model = RandomForestClassifier(**params)
+    model.fit(data["X"], data["y"])
 
-    # NOTE: This saves the last-fitted model (k=49), matching your original intent.
-    output_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "model")
-    os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, filename)
-    with open(output_path, "wb") as f:
-        pickle.dump(kmeans, f)
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    with open(os.path.join(MODEL_DIR, filename), "wb") as f:
+        pickle.dump(model, f)
 
-    return sse  # list is JSON-safe
+    print(f"Saved model to {os.path.join(MODEL_DIR, filename)}")
+    return params
 
 
-def load_model_elbow(filename: str, sse: list):
+def evaluate_model(filename: str, model_params: dict, run_id: str = "manual"):
     """
-    Loads the saved model and uses the elbow method to report k.
-    Returns the first prediction (as a plain int) for test.csv.
+    Loads the saved model, scores it on the held-out wine test set, and appends
+    the result to the metrics history.
+    Returns:
+        dict: JSON-safe metrics for this run.
     """
-    # load the saved (last-fitted) model
-    output_path = os.path.join(os.path.dirname(__file__), "../model", filename)
-    loaded_model = pickle.load(open(output_path, "rb"))
+    with open(os.path.join(MODEL_DIR, filename), "rb") as f:
+        model = pickle.load(f)
 
-    # elbow for information/logging
-    kl = KneeLocator(range(1, 50), sse, curve="convex", direction="decreasing")
-    print(f"Optimal no. of clusters: {kl.elbow}")
+    test_df = pd.read_csv(os.path.join(DATA_DIR, "wine_test.csv")).dropna()
+    X_test = test_df.drop(columns=[TARGET])
+    y_test = test_df[TARGET]
+    pred = model.predict(X_test)
 
-    # predict on raw test data (matches your original code)
-    df = pd.read_csv(os.path.join(os.path.dirname(__file__), "../data/test.csv"))
-    pred = loaded_model.predict(df)[0]
+    metrics = {
+        "run_id": run_id,
+        "accuracy": float(accuracy_score(y_test, pred)),
+        "f1_macro": float(f1_score(y_test, pred, average="macro")),
+        "n_test": int(len(y_test)),
+        "params": model_params,
+    }
+    print(f"Evaluation for {run_id}: accuracy={metrics['accuracy']:.4f}, "
+          f"f1_macro={metrics['f1_macro']:.4f}")
 
-    # ensure JSON-safe return
-    try:
-        return int(pred)
-    except Exception:
-        # if not numeric, still return a JSON-friendly version
-        return pred.item() if hasattr(pred, "item") else pred
+    history = _read_history()
+    # Replace any entry from the same run so task retries don't duplicate it.
+    history = [h for h in history if h["run_id"] != run_id]
+    history.append(metrics)
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    with open(HISTORY_PATH, "w") as f:
+        json.dump(history, f, indent=2)
+
+    return metrics
+
+
+def compare_with_previous_run(metrics: dict):
+    """
+    Compares this run's metrics against the previous run in the history file.
+    Returns:
+        dict: JSON-safe summary with the deltas and a verdict
+        ("baseline", "improved", "unchanged" or "regressed").
+    """
+    history = _read_history()
+    earlier = [h for h in history if h["run_id"] != metrics["run_id"]]
+
+    if not earlier:
+        print("No previous run found. This run is the baseline.")
+        return {"verdict": "baseline", "current": metrics, "previous": None}
+
+    previous = earlier[-1]
+    deltas = {
+        name: round(metrics[name] - previous[name], 4)
+        for name in ("accuracy", "f1_macro")
+    }
+    change = deltas[PRIMARY_METRIC]
+    if change > REGRESSION_TOLERANCE:
+        verdict = "improved"
+    elif change < -REGRESSION_TOLERANCE:
+        verdict = "regressed"
+    else:
+        verdict = "unchanged"
+
+    print(f"Previous run {previous['run_id']}: accuracy={previous['accuracy']:.4f}, "
+          f"f1_macro={previous['f1_macro']:.4f}")
+    print(f"Current run  {metrics['run_id']}: accuracy={metrics['accuracy']:.4f}, "
+          f"f1_macro={metrics['f1_macro']:.4f}")
+    print(f"Deltas: {deltas} -> {verdict.upper()}")
+    return {"verdict": verdict, "deltas": deltas, "current": metrics, "previous": previous}
+
+
+def _read_history() -> list:
+    if not os.path.exists(HISTORY_PATH):
+        return []
+    with open(HISTORY_PATH) as f:
+        return json.load(f)

@@ -1,19 +1,22 @@
 # Import necessary libraries and modules
 from airflow import DAG
-# from airflow.operators.python import PythonOperator
 from airflow.providers.standard.operators.python import PythonOperator
 from datetime import datetime, timedelta
-from src.lab import load_data, data_preprocessing, build_save_model, load_model_elbow
+from src.lab import (
+    load_data,
+    data_preprocessing,
+    build_save_model,
+    evaluate_model,
+    compare_with_previous_run,
+)
 
-# NOTE:
-# In Airflow 3.x, enabling XCom pickling should be done via environment variable:
-# export AIRFLOW__CORE__ENABLE_XCOM_PICKLING=True
-# The old airflow.configuration API is deprecated.
+# All task outputs are base64 strings or plain dicts, so the default
+# JSON XCom backend works and XCom pickling does not need to be enabled.
 
 # Define default arguments for your DAG
 default_args = {
-    'owner': 'Ramin Mohammadi',
-    'start_date': datetime(2026, 1, 15),
+    'owner': 'hd',
+    'start_date': datetime(2026, 10, 29),
     'retries': 0,  # Number of retries in case of task failure
     'retry_delay': timedelta(minutes=5),  # Delay before retries
 }
@@ -22,8 +25,9 @@ default_args = {
 with DAG(
     'Airflow_Lab1',
     default_args=default_args,
-    description='Dag example for Lab 1 of Airflow series',
-    catchup=False, 
+    description='Wine classifier: train, evaluate, and compare against the previous run',
+    schedule=None,  # Trigger manually
+    catchup=False,
 ) as dag:
 
     # Task to load data, calls the 'load_data' Python function
@@ -46,15 +50,28 @@ with DAG(
         op_args=[data_preprocessing_task.output, "model.sav"],
     )
 
-    # Task to load a model using the 'load_model_elbow' function, depends on 'build_save_model_task'
-    load_model_task = PythonOperator(
-        task_id='load_model_task',
-        python_callable=load_model_elbow,
+    # Task to score the saved model on the held-out test set and record the metrics
+    evaluate_model_task = PythonOperator(
+        task_id='evaluate_model_task',
+        python_callable=evaluate_model,
         op_args=["model.sav", build_save_model_task.output],
     )
 
+    # Task to compare this run's metrics with the previous run's
+    compare_runs_task = PythonOperator(
+        task_id='compare_runs_task',
+        python_callable=compare_with_previous_run,
+        op_args=[evaluate_model_task.output],
+    )
+
     # Set task dependencies
-    load_data_task >> data_preprocessing_task >> build_save_model_task >> load_model_task
+    (
+        load_data_task
+        >> data_preprocessing_task
+        >> build_save_model_task
+        >> evaluate_model_task
+        >> compare_runs_task
+    )
 
 # If this script is run directly, allow command-line interaction with the DAG
 if __name__ == "__main__":
